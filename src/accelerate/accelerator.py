@@ -2886,7 +2886,6 @@ class Accelerator:
         """
         if self.native_amp and self.mixed_precision == "fp16":
             if optimizer is None:
-                # TODO: this unscales all optimizers where we should only unscale the one where parameters are.
                 optimizer = self._optimizers
             elif not isinstance(optimizer, (tuple, list)):
                 optimizer = [optimizer]
@@ -2894,6 +2893,37 @@ class Accelerator:
                 while isinstance(opt, AcceleratedOptimizer):
                     opt = opt.optimizer
                 self.scaler.unscale_(opt)
+
+    def _get_associated_optimizers(self, parameters):
+        """
+        Helper to find which optimizers manage the given parameters.
+        """
+        if not isinstance(parameters, list):
+            parameters = list(parameters)
+
+        # We use IDs to find matches
+        param_ids = {id(p) for p in parameters}
+
+        associated_optimizers = []
+        for opt in self._optimizers:
+            # We want to check if any of the optimizer's parameters are in `parameters`
+            # We need to look inside the AcceleratedOptimizer if wrapped
+            inner_opt = opt
+            while isinstance(inner_opt, AcceleratedOptimizer):
+                inner_opt = inner_opt.optimizer
+
+            # Check all param groups
+            found = False
+            for group in inner_opt.param_groups:
+                for p in group["params"]:
+                    if id(p) in param_ids:
+                        associated_optimizers.append(opt)
+                        found = True
+                        break
+                if found:
+                    break
+
+        return associated_optimizers
 
     def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
         """
@@ -2920,9 +2950,13 @@ class Accelerator:
         ...     optimizer.step()
         ```
         """
+        # We need to make sure parameters is a list (to avoid consuming a generator)
+        # as we might iterate over it twice (once to find optimizers, once to clip)
+        if not isinstance(parameters, list):
+            parameters = list(parameters)
+
         if self.distributed_type == DistributedType.FSDP:
             self.unscale_gradients()
-            parameters = [p for p in parameters]
             for model in self._models:
                 if parameters == [p for p in model.parameters()]:
                     if not self.is_fsdp2:
@@ -2951,11 +2985,18 @@ class Accelerator:
                     acc_opt.gradient_state.is_xla_gradients_synced = True
             if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true":
                 self.unscale_gradients()
-                parameters = [p for p in parameters]
                 for model in self._models:
                     if parameters == [p for p in model.parameters()]:
                         return model.clip_grad_norm_(max_norm, norm_type)
-        self.unscale_gradients()
+
+        # Only unscale the optimizers that are associated with the parameters we are clipping
+        optimizers_to_unscale = self._get_associated_optimizers(parameters)
+        if len(optimizers_to_unscale) > 0:
+            self.unscale_gradients(optimizer=optimizers_to_unscale)
+        else:
+            # Fallback for safety, though ideally we should have found an optimizer
+            self.unscale_gradients()
+
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)
 
     def clip_grad_value_(self, parameters, clip_value):
@@ -2982,7 +3023,16 @@ class Accelerator:
         """
         if self.distributed_type in [DistributedType.DEEPSPEED, DistributedType.FSDP]:
             raise Exception("DeepSpeed and FSDP  do not support `clip_grad_value_`. Use `clip_grad_norm_` instead.")
-        self.unscale_gradients()
+
+        if not isinstance(parameters, list):
+            parameters = list(parameters)
+
+        optimizers_to_unscale = self._get_associated_optimizers(parameters)
+        if len(optimizers_to_unscale) > 0:
+            self.unscale_gradients(optimizer=optimizers_to_unscale)
+        else:
+            self.unscale_gradients()
+
         torch.nn.utils.clip_grad_value_(parameters, clip_value)
 
     def gather(self, tensor):
