@@ -18,7 +18,7 @@ import pickle
 import tempfile
 import time
 from unittest import skip
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import psutil
 import torch
@@ -572,6 +572,63 @@ class AcceleratorTester(AccelerateTestCase):
         sgd = torch.optim.SGD(model.parameters(), lr=0.01)
         accelerator = Accelerator(cpu=True)
         _ = accelerator.prepare(sgd)
+
+    def test_gradient_clipping_unscales_only_relevant_optimizers(self):
+        """
+        Tests that calling clip_grad_norm_ unscales only the optimizers associated
+        with the passed parameters, not all optimizers.
+        """
+        accelerator = Accelerator()
+
+        # Mocking setup to simulate native AMP with FP16
+        # We need to bypass the checks in __init__ so we set these after creation
+        # Using a context manager for mocking to ensure clean up if we were mocking actual accelerator methods
+        # but here we are modifying state properties which is fine for this test instance.
+
+        # Force native AMP logic
+        accelerator.native_amp = True
+        # We need to set the mixed_precision on the state
+        accelerator.state._mixed_precision = "fp16"
+
+        # Mock the scaler
+        accelerator.scaler = MagicMock()
+        accelerator.scaler.unscale_ = MagicMock()
+
+        # Create two models and two optimizers
+        model1 = torch.nn.Linear(10, 10)
+        optimizer1 = torch.optim.SGD(model1.parameters(), lr=0.01)
+
+        model2 = torch.nn.Linear(10, 10)
+        optimizer2 = torch.optim.SGD(model2.parameters(), lr=0.01)
+
+        # Prepare them
+        model1, optimizer1, model2, optimizer2 = accelerator.prepare(model1, optimizer1, model2, optimizer2)
+
+        # Call clip_grad_norm_ on model1 parameters only
+        # We pass a generator to verify that the implementation handles it correctly (converts to list)
+        accelerator.clip_grad_norm_(model1.parameters(), 1.0)
+
+        # Verify unscale_ was called exactly once (for optimizer1)
+        assert accelerator.scaler.unscale_.call_count == 1
+
+        # Verify it was called with the correct optimizer
+        # accelerator.prepare wraps the optimizer, but unscale_ takes the inner one if it handles unscaling,
+        # or the wrapper. In accelerate implementation:
+        # for opt in optimizer:
+        #     while isinstance(opt, AcceleratedOptimizer):
+        #         opt = opt.optimizer
+        #     self.scaler.unscale_(opt)
+
+        # Get the inner optimizer that should have been passed to unscale_
+        inner_opt1 = optimizer1.optimizer
+
+        # Check arguments
+        call_args = accelerator.scaler.unscale_.call_args
+        assert call_args is not None, "unscale_ should have been called"
+        unscaled_optimizer = call_args[0][0]
+
+        assert unscaled_optimizer is inner_opt1, "Should have unscaled optimizer 1"
+        assert unscaled_optimizer is not optimizer2.optimizer, "Should not have unscaled optimizer 2"
 
     @require_fp8
     @require_transformer_engine
