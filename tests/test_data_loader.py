@@ -106,6 +106,67 @@ class DataLoaderTester(AccelerateTestCase):
             assert [len(shard) for shard in batch_sampler_shards] == [len(e) for e in expected]
         assert batch_sampler_lists == expected
 
+    def test_batch_sampler_shards_dynamic(self):
+        """
+        Tests that BatchSamplerShard yields batches even if they don't match the reported batch_size,
+        provided that drop_last is True (common in dynamic batching scenarios).
+        """
+
+        class DynamicBatchSampler(BatchSampler):
+            def __init__(self, data_source, batch_size, drop_last):
+                self.batches = [[0], [1], [2], [3]]  # 4 batches of size 1
+                self.batch_size = batch_size  # Report a mismatched batch_size (e.g. 10)
+                self.drop_last = drop_last
+
+            def __iter__(self):
+                return iter(self.batches)
+
+            def __len__(self):
+                return len(self.batches)
+
+        # Case 1: drop_last=True. With the fix, this should yield batches [0] and [2] (for 2 processes)
+        # despite batch_size mismatch.
+        sampler = DynamicBatchSampler(range(4), batch_size=10, drop_last=True)
+
+        # P0 should get batch 0 ([0]) and batch 2 ([2])
+        # Explanation:
+        # idx 0: P0 gets [0]. Yields [0].
+        # idx 1: P1 gets [1]. Yields [1].
+        # idx 2: P0 gets [2]. Yields [2].
+        # idx 3: P1 gets [3]. Yields [3].
+        shard0 = BatchSamplerShard(sampler, num_processes=2, process_index=0, split_batches=False, even_batches=True)
+        batches0 = list(shard0)
+        assert len(batches0) == 2
+        assert batches0[0] == [0]
+        assert batches0[1] == [2]
+
+        # P1 should get batch 1 ([1]) and batch 3 ([3])
+        # Wait, BatchSamplerShard iterates enumerate(sampler).
+        # idx 0 -> P0. batch=[0]. Yields [0].
+        # idx 1 -> P1. batch=[1]. Yields [1].
+        # idx 2 -> P0. batch=[2]. Yields [2].
+        # idx 3 -> P1. batch=[3]. Yields [3].
+
+        # The logic: yield if idx % num_processes == num_processes - 1
+        # P0 yields batch_to_yield (which is batch at idx) IF condition met.
+        # But idx % 2 == 1 is checked.
+        # idx 0: P0 keeps batch [0].
+        # idx 1: P1 keeps batch [1]. Check 1 % 2 == 1. Yield batch_to_yield.
+        # P0 yields [0]. P1 yields [1].
+
+        # idx 2: P0 keeps batch [2].
+        # idx 3: P1 keeps batch [3]. Check 3 % 2 == 1. Yield.
+        # P0 yields [2]. P1 yields [3].
+
+        shard1 = BatchSamplerShard(sampler, num_processes=2, process_index=1, split_batches=False, even_batches=True)
+        batches1 = list(shard1)
+        assert len(batches1) == 2
+        assert batches1[0] == [1]
+        assert batches1[1] == [3]
+
+        assert len(batches0) == 2
+        assert batches0[1] == [2]
+
     def test_batch_sampler_shards_with_no_splits(self):
         # Check the shards when the dataset is a round multiple of total batch size.
         batch_sampler = BatchSampler(range(24), batch_size=3, drop_last=False)

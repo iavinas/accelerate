@@ -227,7 +227,7 @@ class BatchSamplerShard(BatchSampler):
             if idx % self.num_processes == self.process_index:
                 batch_to_yield = batch
             if idx % self.num_processes == self.num_processes - 1 and (
-                self.batch_size is None or len(batch) == self.batch_size
+                self.batch_size is None or len(batch) == self.batch_size or (self.drop_last and len(batch) > 0)
             ):
                 yield batch_to_yield
                 batch_to_yield = []
