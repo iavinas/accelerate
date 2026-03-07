@@ -812,6 +812,21 @@ class TrackerDeferredInitializationTest(unittest.TestCase):
         _ = Accelerator(log_with=tracker)
         self.assertNotEqual(PartialState._shared_state, {})
 
+    @require_trackio
+    def test_trackio_log_step(self):
+        """Test that TrackioTracker.log() forwards the step parameter"""
+        _ = Accelerator()
+        tracker = TrackioTracker(run_name="test_step")
+        tracker._is_main_process = True
+        tracker.start()
+
+        tracker.log({"loss": 0.5}, step=42)
+        tracker.log({"loss": 0.3}, step=100)
+
+        steps = [e["step"] for e in tracker.tracker._queued_logs]
+        self.assertEqual(steps, [42, 100])
+        tracker.finish()
+
     @require_comet_ml
     def test_comet_ml_deferred_init(self):
         """Test that CometML tracker initialization doesn't initialize distributed"""
