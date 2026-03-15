@@ -477,8 +477,13 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
         Regression test: the upcast loop used `param = param.to(torch.float32)` which
         only rebinds the local variable, leaving the model's parameters unchanged.
         The fix is `param.data = param.data.to(torch.float32)`.
+
+        This test calls fsdp2_prepare_model directly (with fully_shard and auto_wrap_policy
+        mocked out) to ensure the upcast actually happens in the real code path.
         """
-        from unittest.mock import MagicMock
+        from unittest.mock import MagicMock, patch
+
+        from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
         model = torch.nn.Linear(4, 4).to(torch.bfloat16)
         assert all(p.dtype == torch.bfloat16 for p in model.parameters()), "Setup: model should start in bf16"
@@ -486,25 +491,24 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
         mock_accelerator = MagicMock()
         mock_accelerator.mixed_precision = "bf16"
         mock_accelerator.is_main_process = True
-        mock_accelerator.state.fsdp_plugin.param_init_fn = None
-        mock_accelerator.state.fsdp_plugin.sync_module_states = False
+        mock_accelerator.torch_device_mesh = None
+        mock_accelerator.device = torch.device("cpu")
+        # Non-ram-efficient path: upcast happens before fully_shard
+        mock_accelerator.state.fsdp_plugin.cpu_ram_efficient_loading = False
+        mock_accelerator.state.fsdp_plugin.reshard_after_forward = True
+        mock_accelerator.state.fsdp_plugin.cpu_offload = None
+        mock_accelerator.state.fsdp_plugin.mixed_precision_policy = None
+        mock_accelerator.state.fsdp_plugin.ignored_modules = None
+        mock_accelerator.parallelism_config = None
 
-        # fsdp2_prepare_model does other work (sharding, state dict loading) that
-        # requires a real distributed env. We only need to test the upcast loop at
-        # the end, so we extract and replicate that logic here.
-        import warnings
+        with (
+            patch("torch.distributed.fsdp.fully_shard", return_value=None),
+            patch("torch.distributed.fsdp.FSDPModule", new=type(None)),
+            patch("accelerate.utils.fsdp_utils.fsdp2_prepare_auto_wrap_policy", return_value=None),
+        ):
+            result_model = fsdp2_prepare_model(mock_accelerator, model)
 
-        model_dtype = getattr(model, "dtype", None)
-        if mock_accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32):
-            upcasted_params = []
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.dtype != torch.float32:
-                    upcasted_params.append(name)
-                    param.data = param.data.to(torch.float32)
-            if mock_accelerator.is_main_process and upcasted_params:
-                warnings.warn(f"Upcasted {len(upcasted_params)} params")
-
-        for name, param in model.named_parameters():
+        for name, param in result_model.named_parameters():
             self.assertEqual(
                 param.dtype,
                 torch.float32,

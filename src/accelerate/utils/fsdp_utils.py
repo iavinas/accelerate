@@ -519,11 +519,6 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 # After prepare_tp(), model parameters may become DTensor.
                 # To broadcast such a parameter, convert it to a local tensor first.
                 full_param = full_param.to_local()
-            print(
-                f"[RANK 0] broadcast {param_name}: dtype={full_param.dtype}, "
-                f"shape={full_param.shape}, nbytes={full_param.nbytes}",
-                flush=True,
-            )
             dist.broadcast(full_param, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_param, device_mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
@@ -541,11 +536,6 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         for param_name, sharded_param in meta_sharded_sd.items():
             device_mesh = sharded_param.device_mesh
             full_tensor = torch.empty(sharded_param.size(), device=device_mesh.device_type, dtype=sharded_param.dtype)
-            print(
-                f"[RANK {dist.get_rank()}] broadcast recv {param_name}: dtype={full_tensor.dtype}, "
-                f"shape={full_tensor.shape}, nbytes={full_tensor.nbytes}",
-                flush=True,
-            )
             dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_tensor, device_mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
@@ -676,10 +666,12 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             model_has_params4bit = True
             break
 
-    # Upcast trainable parameters to fp32 BEFORE fully_shard so FSDP2 records the correct master dtype.
-    # If we upcast after wrapping, FSDP2's internal dtype tracking stays at bf16/fp16, causing
-    # a dtype mismatch between params (fp32) and gradients (bf16) at optimizer.step().
-    # This matches the intent of the FSDP1 upcast in accelerator.py:prepare_model.
+    # Upcast trainable parameters to fp32 for mixed-precision training.
+    # Non-ram-efficient path: upcast before fully_shard so FSDP2 records fp32 as the
+    # master parameter dtype (fully_shard snapshots param dtype at call time).
+    # Ram-efficient path: upcast AFTER fsdp2_load_full_state_dict (params start on meta, become
+    # real sharded DTensors only after loading). The state dict must stay in its original dtype
+    # so broadcast dtypes match across ranks during distributed loading.
     model_dtype = getattr(model, "dtype", None)
     upcasted_params = []
     should_upcast = accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32)
@@ -698,14 +690,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             {k: v for k, v in model.named_buffers() if k in non_persistent_buffer_fqns}
         )
 
-        # Upcast the state dict to fp32 before loading (model will be on meta device, can't upcast meta tensors)
-        if should_upcast:
-            for key, value in original_sd.items():
-                if value.is_floating_point() and value.dtype != torch.float32:
-                    original_sd[key] = value.to(torch.float32)
-
         # We move the model to meta device, as then sharding happens on meta device
-        print(f"[RANK {torch.distributed.get_rank()}] moving model to meta device", flush=True)
         model = model.to(torch.device("meta"))
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
         # We assume `transformers` models have a `tie_weights` method if they support it
@@ -726,9 +711,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
                 fully_shard(module, **fsdp2_kwargs)
 
     if not isinstance(model, FSDPModule):
-        print(f"[RANK {torch.distributed.get_rank()}] calling fully_shard on model", flush=True)
         fully_shard(model, **fsdp2_kwargs)
-        print(f"[RANK {torch.distributed.get_rank()}] fully_shard complete", flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
         # If `cpu_ram_efficient_loading` is enabled, only rank 0 loads the weights
@@ -736,11 +719,9 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         # When CPU offloading is enabled, parameters need to stay on CPU after distribution
         from torch.distributed.fsdp import CPUOffloadPolicy
 
-        print(f"[RANK {torch.distributed.get_rank()}] entering fsdp2_load_full_state_dict, sd keys={len(original_sd)}", flush=True)
         fsdp2_load_full_state_dict(
             accelerator, model, original_sd, cpu_offload=isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy)
         )
-        print(f"[RANK {torch.distributed.get_rank()}] exited fsdp2_load_full_state_dict", flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # We re-register the buffers, as they may not be in the state_dict
@@ -756,6 +737,18 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
             parent_module.register_buffer(local_buffer_name, buffer_tensor, persistent=False)
 
+        # Upcast sharded params to fp32 before tie_weights so tied params share fp32 tensors.
+        # This must happen after fsdp2_load_full_state_dict (params are real sharded DTensors now)
+        # and before tie_weights (so tied params point to the same fp32 data).
+        # Note: unlike FSDP1 (which stores _handle._orig_param_dtype), FSDP2 reads actual param.dtype
+        # at runtime via MixedPrecisionPolicy hooks. Upcasting param.data after fully_shard is safe
+        # because FSDP2 will see fp32 and cast to param_dtype (e.g. bf16) during forward.
+        if should_upcast:
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.dtype != torch.float32:
+                    upcasted_params.append(name)
+                    param.data = param.data.to(torch.float32)
+
         # We need to tie the weights again, as call to `load_full_state_dict` breaks the tie
         # Needs to be called both here and above
         # removing this call makes the have slightly different loss
@@ -763,16 +756,10 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
 
-    # For ram-efficient path, collect upcasted param names now (upcast was done on state dict before loading)
-    if should_upcast and fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                upcasted_params.append(name)
-
     if accelerator.is_main_process and upcasted_params:
         warnings.warn(
             "FSDP upcast of low precision parameters to fp32 (since mixed_precision != 'no') may affect the precision of model checkpoints. "
-            f"This effects {len(upcasted_params)} parameters: {upcasted_params}..."
+            f"This affects {len(upcasted_params)} parameters: {upcasted_params}..."
         )
     return model
 
