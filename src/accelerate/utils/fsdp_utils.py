@@ -705,6 +705,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
                     original_sd[key] = value.to(torch.float32)
 
         # We move the model to meta device, as then sharding happens on meta device
+        print(f"[RANK {dist.get_rank()}] moving model to meta device", flush=True)
         model = model.to(torch.device("meta"))
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
         # We assume `transformers` models have a `tie_weights` method if they support it
@@ -725,7 +726,9 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
                 fully_shard(module, **fsdp2_kwargs)
 
     if not isinstance(model, FSDPModule):
+        print(f"[RANK {dist.get_rank()}] calling fully_shard on model", flush=True)
         fully_shard(model, **fsdp2_kwargs)
+        print(f"[RANK {dist.get_rank()}] fully_shard complete", flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
         # If `cpu_ram_efficient_loading` is enabled, only rank 0 loads the weights
@@ -733,9 +736,11 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         # When CPU offloading is enabled, parameters need to stay on CPU after distribution
         from torch.distributed.fsdp import CPUOffloadPolicy
 
+        print(f"[RANK {dist.get_rank()}] entering fsdp2_load_full_state_dict, sd keys={len(original_sd)}", flush=True)
         fsdp2_load_full_state_dict(
             accelerator, model, original_sd, cpu_offload=isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy)
         )
+        print(f"[RANK {dist.get_rank()}] exited fsdp2_load_full_state_dict", flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # We re-register the buffers, as they may not be in the state_dict
