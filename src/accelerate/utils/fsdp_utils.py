@@ -666,6 +666,14 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             model_has_params4bit = True
             break
 
+    # Upcast trainable parameters to fp32 BEFORE fully_shard so FSDP2 records the correct master dtype.
+    # If we upcast after wrapping, FSDP2's internal dtype tracking stays at bf16/fp16, causing
+    # a dtype mismatch between params (fp32) and gradients (bf16) at optimizer.step().
+    # This matches the intent of the FSDP1 upcast in accelerator.py:prepare_model.
+    model_dtype = getattr(model, "dtype", None)
+    upcasted_params = []
+    should_upcast = accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32)
+
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # Context: `fully_shard` moves the model to GPU if it was on CPU, however it can also be on `meta` and then it stays there even after `fully_shard`
         # For this reason, we need to move the model to `meta` device, as then sharding happens on `meta` device
@@ -679,12 +687,25 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         original_non_persistent_buffers = copy.deepcopy(
             {k: v for k, v in model.named_buffers() if k in non_persistent_buffer_fqns}
         )
+
+        # Upcast the state dict to fp32 before loading (model will be on meta device, can't upcast meta tensors)
+        if should_upcast:
+            for key, value in original_sd.items():
+                if value.is_floating_point() and value.dtype != torch.float32:
+                    original_sd[key] = value.to(torch.float32)
+
         # We move the model to meta device, as then sharding happens on meta device
         model = model.to(torch.device("meta"))
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
         # We assume `transformers` models have a `tie_weights` method if they support it
         if hasattr(model, "tie_weights"):
             model.tie_weights()
+    elif should_upcast:
+        # Non-ram-efficient path: upcast model params directly before fully_shard
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.dtype != torch.float32:
+                upcasted_params.append(name)
+                param.data = param.data.to(torch.float32)
 
     auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     if auto_wrap_policy_func is not None:
@@ -727,22 +748,17 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
 
-    # There is no `dtype` attribution for nn.Module
-    # Set it to None if it doesn't exist and do the upcast always
-    model_dtype = getattr(model, "dtype", None)
-    if accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32):
-        # We upcast the trainable parameters according to `deepspeed`'s implementation
-        # More info about this can be found in `accelerator.py:prepare_model`s FSDP1 section
-        upcasted_params = []
+    # For ram-efficient path, collect upcasted param names now (upcast was done on state dict before loading)
+    if should_upcast and fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         for name, param in model.named_parameters():
-            if param.requires_grad and param.dtype != torch.float32:
+            if param.requires_grad:
                 upcasted_params.append(name)
-                param.data = param.data.to(torch.float32)
-        if accelerator.is_main_process and upcasted_params:
-            warnings.warn(
-                "FSDP upcast of low precision parameters to fp32 (since mixed_precision != 'no') may affect the precision of model checkpoints. "
-                f"This effects {len(upcasted_params)} parameters: {upcasted_params}..."
-            )
+
+    if accelerator.is_main_process and upcasted_params:
+        warnings.warn(
+            "FSDP upcast of low precision parameters to fp32 (since mixed_precision != 'no') may affect the precision of model checkpoints. "
+            f"This effects {len(upcasted_params)} parameters: {upcasted_params}..."
+        )
     return model
 
 
