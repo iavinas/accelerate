@@ -519,9 +519,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 # After prepare_tp(), model parameters may become DTensor.
                 # To broadcast such a parameter, convert it to a local tensor first.
                 full_param = full_param.to_local()
-            logger.info(
+            print(
                 f"[RANK 0] broadcast {param_name}: dtype={full_param.dtype}, "
-                f"shape={full_param.shape}, nbytes={full_param.nbytes}"
+                f"shape={full_param.shape}, nbytes={full_param.nbytes}",
+                flush=True,
             )
             dist.broadcast(full_param, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_param, device_mesh, sharded_param.placements)
@@ -540,9 +541,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         for param_name, sharded_param in meta_sharded_sd.items():
             device_mesh = sharded_param.device_mesh
             full_tensor = torch.empty(sharded_param.size(), device=device_mesh.device_type, dtype=sharded_param.dtype)
-            logger.info(
+            print(
                 f"[RANK {dist.get_rank()}] broadcast recv {param_name}: dtype={full_tensor.dtype}, "
-                f"shape={full_tensor.shape}, nbytes={full_tensor.nbytes}"
+                f"shape={full_tensor.shape}, nbytes={full_tensor.nbytes}",
+                flush=True,
             )
             dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_tensor, device_mesh, sharded_param.placements)
