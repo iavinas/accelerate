@@ -667,11 +667,12 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             break
 
     # Upcast trainable parameters to fp32 for mixed-precision training.
-    # Non-ram-efficient path: upcast before fully_shard so FSDP2 records fp32 as the
-    # master parameter dtype (fully_shard snapshots param dtype at call time).
-    # Ram-efficient path: upcast AFTER fsdp2_load_full_state_dict (params start on meta, become
-    # real sharded DTensors only after loading). The state dict must stay in its original dtype
-    # so broadcast dtypes match across ranks during distributed loading.
+    # FSDP2 snapshots param dtype at fully_shard() time, so both paths must ensure
+    # fully_shard sees fp32 params:
+    # Non-ram-efficient path: upcast model params directly before fully_shard.
+    # Ram-efficient path: upcast both the state dict (so broadcast sends fp32 from rank 0
+    # and receive buffers on other ranks are fp32) AND move the meta model to fp32
+    # (so fully_shard records fp32 as the master dtype).
     model_dtype = getattr(model, "dtype", None)
     upcasted_params = []
     should_upcast = accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32)
@@ -690,8 +691,20 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             {k: v for k, v in model.named_buffers() if k in non_persistent_buffer_fqns}
         )
 
-        # We move the model to meta device, as then sharding happens on meta device
-        model = model.to(torch.device("meta"))
+        # Upcast state dict to fp32 so both broadcast sides use fp32.
+        # We also move the meta model to fp32 so fully_shard records fp32 as the master dtype
+        # and receive buffers (derived from sharded_param.dtype) are allocated as fp32.
+        if should_upcast:
+            for key, value in original_sd.items():
+                if value.is_floating_point() and value.dtype != torch.float32:
+                    original_sd[key] = value.to(torch.float32)
+
+        # We move the model to meta device, as then sharding happens on meta device.
+        # When upcasting, also cast to fp32 so fully_shard snapshots fp32 as the param dtype.
+        meta_kwargs = {"device": "meta"}
+        if should_upcast:
+            meta_kwargs["dtype"] = torch.float32
+        model = model.to(**meta_kwargs)
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
         # We assume `transformers` models have a `tie_weights` method if they support it
         if hasattr(model, "tie_weights"):
@@ -737,17 +750,11 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
             parent_module.register_buffer(local_buffer_name, buffer_tensor, persistent=False)
 
-        # Upcast sharded params to fp32 before tie_weights so tied params share fp32 tensors.
-        # This must happen after fsdp2_load_full_state_dict (params are real sharded DTensors now)
-        # and before tie_weights (so tied params point to the same fp32 data).
-        # Note: unlike FSDP1 (which stores _handle._orig_param_dtype), FSDP2 reads actual param.dtype
-        # at runtime via MixedPrecisionPolicy hooks. Upcasting param.data after fully_shard is safe
-        # because FSDP2 will see fp32 and cast to param_dtype (e.g. bf16) during forward.
+        # Collect upcasted param names for the warning (upcast was done on state dict before loading)
         if should_upcast:
             for name, param in model.named_parameters():
-                if param.requires_grad and param.dtype != torch.float32:
+                if param.requires_grad:
                     upcasted_params.append(name)
-                    param.data = param.data.to(torch.float32)
 
         # We need to tie the weights again, as call to `load_full_state_dict` breaks the tie
         # Needs to be called both here and above
