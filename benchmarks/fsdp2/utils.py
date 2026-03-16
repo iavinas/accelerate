@@ -189,7 +189,9 @@ def prepare_dataloader(tokenizer, args, accelerator: Accelerator) -> DataLoader:
 
 
 def get_model(model_name: str):
-    # We reguire model to be loaded in fp32, otherwise benchmarks don't match as accelerate does upcasting of parameters to fp32
+    # Load in fp32 so both torch baselines and accelerate start from the same dtype.
+    # accelerate upcasts low-precision params to fp32 when mixed_precision is enabled,
+    # but the raw torch baselines don't upcast, so we use fp32 to keep benchmarks comparable.
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.float32)
     model = AutoModelForCausalLM.from_config(config)
     return model
