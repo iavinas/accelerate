@@ -674,6 +674,11 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     # and receive buffers on other ranks are fp32) AND move the meta model to fp32
     # (so fully_shard records fp32 as the master dtype).
     model_dtype = getattr(model, "dtype", None)
+    if model_dtype is None:
+        # nn.Module doesn't expose .dtype; infer from first parameter
+        first_param = next((p for p in model.parameters()), None)
+        if first_param is not None:
+            model_dtype = first_param.dtype
     upcasted_params = []
     should_upcast = accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32)
 
@@ -743,7 +748,8 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         )
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
-        # We re-register the buffers, as they may not be in the state_dict
+        # Re-register non-persistent buffers in their original dtype (not upcast to fp32).
+        # These are typically masks or positional encodings handled by autocast during forward.
         for fqn, buffer_tensor in original_non_persistent_buffers.items():
             buffer_tensor = buffer_tensor.to(accelerator.device)
 

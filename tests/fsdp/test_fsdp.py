@@ -471,6 +471,22 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
 
         AcceleratorState._reset_state(True)
 
+    def _make_mock_accelerator(self, mixed_precision="bf16", cpu_ram_efficient_loading=False):
+        from unittest.mock import MagicMock
+
+        mock = MagicMock()
+        mock.mixed_precision = mixed_precision
+        mock.is_main_process = True
+        mock.torch_device_mesh = None
+        mock.device = torch.device("cpu")
+        mock.state.fsdp_plugin.cpu_ram_efficient_loading = cpu_ram_efficient_loading
+        mock.state.fsdp_plugin.reshard_after_forward = True
+        mock.state.fsdp_plugin.cpu_offload = None
+        mock.state.fsdp_plugin.mixed_precision_policy = None
+        mock.state.fsdp_plugin.ignored_modules = None
+        mock.parallelism_config = None
+        return mock
+
     def test_fsdp2_mixed_precision_param_upcast(self):
         """Verify that trainable params are actually upcasted to fp32 under mixed precision.
 
@@ -481,25 +497,14 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
         This test calls fsdp2_prepare_model directly (with fully_shard and auto_wrap_policy
         mocked out) to ensure the upcast actually happens in the real code path.
         """
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
         model = torch.nn.Linear(4, 4).to(torch.bfloat16)
         assert all(p.dtype == torch.bfloat16 for p in model.parameters()), "Setup: model should start in bf16"
 
-        mock_accelerator = MagicMock()
-        mock_accelerator.mixed_precision = "bf16"
-        mock_accelerator.is_main_process = True
-        mock_accelerator.torch_device_mesh = None
-        mock_accelerator.device = torch.device("cpu")
-        # Non-ram-efficient path: upcast happens before fully_shard
-        mock_accelerator.state.fsdp_plugin.cpu_ram_efficient_loading = False
-        mock_accelerator.state.fsdp_plugin.reshard_after_forward = True
-        mock_accelerator.state.fsdp_plugin.cpu_offload = None
-        mock_accelerator.state.fsdp_plugin.mixed_precision_policy = None
-        mock_accelerator.state.fsdp_plugin.ignored_modules = None
-        mock_accelerator.parallelism_config = None
+        mock_accelerator = self._make_mock_accelerator(mixed_precision="bf16")
 
         with (
             patch("torch.distributed.fsdp.fully_shard", return_value=None),
@@ -515,25 +520,57 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
                 f"Parameter '{name}' should be float32 after upcast, got {param.dtype}",
             )
 
+    def test_fsdp2_mixed_precision_param_upcast_ram_efficient(self):
+        """Verify the ram-efficient path upcasts state dict and meta model to fp32.
+
+        In the ram-efficient path, the model is moved to meta device and state dict is
+        broadcast via fsdp2_load_full_state_dict. The state dict must be upcast to fp32
+        and the meta model must be moved with dtype=fp32 so fully_shard records fp32
+        as the master dtype and broadcast dtypes match across ranks.
+        """
+        from unittest.mock import patch
+
+        from accelerate.utils.fsdp_utils import fsdp2_prepare_model
+
+        model = torch.nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+        original_sd = model.state_dict()
+        assert all(v.dtype == torch.bfloat16 for v in original_sd.values()), "Setup: state dict should be bf16"
+
+        mock_accelerator = self._make_mock_accelerator(mixed_precision="bf16", cpu_ram_efficient_loading=True)
+
+        captured_sd = {}
+
+        def mock_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
+            # Capture the state dict as passed to verify it was upcast
+            for k, v in full_sd.items():
+                captured_sd[k] = v.dtype
+
+        with (
+            patch("torch.distributed.fsdp.fully_shard", return_value=None),
+            patch("torch.distributed.fsdp.FSDPModule", new=type(None)),
+            patch("accelerate.utils.fsdp_utils.fsdp2_prepare_auto_wrap_policy", return_value=None),
+            patch("accelerate.utils.fsdp_utils.fsdp2_load_full_state_dict", side_effect=mock_load_full_state_dict),
+            patch("accelerate.utils.fsdp_utils.get_non_persistent_buffers", return_value=set()),
+        ):
+            result_model = fsdp2_prepare_model(mock_accelerator, model)
+
+        # Verify state dict was upcast to fp32 before being passed to load
+        for key, dtype in captured_sd.items():
+            self.assertEqual(dtype, torch.float32, f"State dict key '{key}' should be fp32, got {dtype}")
+
+        # Verify model was moved to meta (params are now meta tensors)
+        for name, param in result_model.named_parameters():
+            self.assertEqual(param.device.type, "meta", f"Parameter '{name}' should be on meta device")
+            self.assertEqual(param.dtype, torch.float32, f"Parameter '{name}' should be fp32 on meta")
+
     def test_fsdp2_no_upcast_without_mixed_precision(self):
         """Verify that params are NOT upcasted when mixed_precision='no'."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
         model = torch.nn.Linear(4, 4).to(torch.bfloat16)
-
-        mock_accelerator = MagicMock()
-        mock_accelerator.mixed_precision = "no"
-        mock_accelerator.is_main_process = True
-        mock_accelerator.torch_device_mesh = None
-        mock_accelerator.device = torch.device("cpu")
-        mock_accelerator.state.fsdp_plugin.cpu_ram_efficient_loading = False
-        mock_accelerator.state.fsdp_plugin.reshard_after_forward = True
-        mock_accelerator.state.fsdp_plugin.cpu_offload = None
-        mock_accelerator.state.fsdp_plugin.mixed_precision_policy = None
-        mock_accelerator.state.fsdp_plugin.ignored_modules = None
-        mock_accelerator.parallelism_config = None
+        mock_accelerator = self._make_mock_accelerator(mixed_precision="no")
 
         with (
             patch("torch.distributed.fsdp.fully_shard", return_value=None),
@@ -551,23 +588,12 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
 
     def test_fsdp2_no_upcast_for_fp32_model(self):
         """Verify that an fp32 model is not upcasted even with mixed precision enabled."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
         model = torch.nn.Linear(4, 4)  # default fp32
-
-        mock_accelerator = MagicMock()
-        mock_accelerator.mixed_precision = "bf16"
-        mock_accelerator.is_main_process = True
-        mock_accelerator.torch_device_mesh = None
-        mock_accelerator.device = torch.device("cpu")
-        mock_accelerator.state.fsdp_plugin.cpu_ram_efficient_loading = False
-        mock_accelerator.state.fsdp_plugin.reshard_after_forward = True
-        mock_accelerator.state.fsdp_plugin.cpu_offload = None
-        mock_accelerator.state.fsdp_plugin.mixed_precision_policy = None
-        mock_accelerator.state.fsdp_plugin.ignored_modules = None
-        mock_accelerator.parallelism_config = None
+        mock_accelerator = self._make_mock_accelerator(mixed_precision="bf16")
 
         with (
             patch("torch.distributed.fsdp.fully_shard", return_value=None),
