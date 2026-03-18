@@ -609,6 +609,76 @@ class FSDP2PluginIntegration(FSDPPluginIntegration):
                 f"Parameter '{name}' should remain float32, got {param.dtype}",
             )
 
+    @require_non_torch_xla
+    def test_fsdp2_mixed_precision_param_upcast_dtensor(self):
+        """Verify upcast works when params are DTensors (from TP applied before FSDP2).
+
+        PR #3905 found that DTensor doesn't support param.data = param.data.to(fp32)
+        and DTensor caches dtype at the C level. The fix reconstructs the DTensor
+        via DTensor.from_local() with an fp32 local tensor and replaces the parameter.
+
+        This test uses real DTensors (via gloo on CPU) to verify both param.dtype
+        and _local_tensor.dtype are fp32 after the upcast.
+        """
+        import os
+        from unittest.mock import patch
+
+        import torch.distributed as dist
+        from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
+
+        from accelerate.utils.fsdp_utils import fsdp2_prepare_model
+
+        # Init minimal distributed env for DTensor (single process, gloo)
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29501")
+        if not dist.is_initialized():
+            dist.init_process_group("gloo", rank=0, world_size=1)
+        mesh = DeviceMesh("cpu", [0])
+
+        try:
+            model = torch.nn.Linear(4, 4).to(torch.bfloat16)
+
+            # Simulate TP: wrap params as real DTensors
+            for name, param in list(model.named_parameters()):
+                dt = DTensor.from_local(param.data, mesh, [Replicate()])
+                dp = torch.nn.Parameter(dt, requires_grad=True)
+                parts = name.rsplit(".", 1)
+                if len(parts) == 2:
+                    setattr(model.get_submodule(parts[0]), parts[1], dp)
+                else:
+                    setattr(model, name, dp)
+
+            # Verify setup
+            for name, param in model.named_parameters():
+                self.assertIsInstance(param, DTensor, f"{name} should be DTensor")
+                self.assertEqual(param.dtype, torch.bfloat16, f"{name} should be bf16")
+
+            mock_accelerator = self._make_mock_accelerator(mixed_precision="bf16")
+
+            with (
+                patch("torch.distributed.fsdp.fully_shard", return_value=None),
+                patch("torch.distributed.fsdp.FSDPModule", new=type(None)),
+                patch("accelerate.utils.fsdp_utils.fsdp2_prepare_auto_wrap_policy", return_value=None),
+            ):
+                result_model = fsdp2_prepare_model(mock_accelerator, model)
+
+            # Verify: both param.dtype AND _local_tensor.dtype are fp32
+            for name, param in result_model.named_parameters():
+                self.assertIsInstance(param, DTensor, f"{name} should still be DTensor")
+                self.assertEqual(
+                    param.dtype,
+                    torch.float32,
+                    f"Parameter '{name}' dtype should be fp32, got {param.dtype}",
+                )
+                self.assertEqual(
+                    param._local_tensor.dtype,
+                    torch.float32,
+                    f"Parameter '{name}' _local_tensor should be fp32, got {param._local_tensor.dtype}",
+                )
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
 
 @run_first
 # Skip this test when TorchXLA is available because accelerate.launch does not support TorchXLA FSDP.

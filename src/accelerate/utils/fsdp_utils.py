@@ -718,11 +718,31 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
     elif should_upcast:
-        # Non-ram-efficient path: upcast model params directly before fully_shard
-        for name, param in model.named_parameters():
+        # Non-ram-efficient path: upcast model params directly before fully_shard.
+        # When TP is applied first (_prepare_tp), params are already DTensors.
+        # DTensor caches dtype at the C level, so mutating _local_tensor.data alone
+        # leaves param.dtype stale (still bf16). We must reconstruct the DTensor
+        # with an fp32 local tensor and replace the parameter on the module.
+        from torch.distributed.tensor import DTensor
+
+        for name, param in list(model.named_parameters()):
             if param.requires_grad and param.dtype != torch.float32:
                 upcasted_params.append(name)
-                param.data = param.data.to(torch.float32)
+                if isinstance(param, DTensor):
+                    new_dt = DTensor.from_local(
+                        param._local_tensor.to(torch.float32),
+                        param.device_mesh,
+                        param.placements,
+                    )
+                    new_param = torch.nn.Parameter(new_dt, requires_grad=True)
+                    parts = name.rsplit(".", 1)
+                    if len(parts) == 2:
+                        parent = model.get_submodule(parts[0])
+                        setattr(parent, parts[1], new_param)
+                    else:
+                        setattr(model, name, new_param)
+                else:
+                    param.data = param.data.to(torch.float32)
 
     auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     if auto_wrap_policy_func is not None:
